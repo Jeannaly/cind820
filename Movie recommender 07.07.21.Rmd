@@ -1,0 +1,344 @@
+---
+title: "Movie Recommender"
+author: "Jeannaly Cruz"
+date: "25/06/2021"
+output: html_document
+---
+```{r}
+library(data.table) #to transform the attributes
+library(proxy)
+library(reshape2)
+library(arules)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+```
+
+#DATA CLEANING AND TRANSFORMATION
+```{r}
+getwd()
+movies<-read.csv('movies.csv', na.strings = c("", "NA") )
+ratings<-read.csv('ratings.csv', na.strings = c("", "NA"))
+movies$movieId<-paste("M", movies$movieId,sep = "")
+head(movies)
+ratings<-ratings[,-4]
+ratings$userId<- paste("U", ratings$userId,sep = "")
+ratings$movieId<-paste("M", ratings$movieId,sep = "")
+head(ratings)
+str(movies)
+str(ratings)
+#I modify the user and movie Id's to add clarity when manipulating the data, I also removed the rating's timestamp. since that level of granularity is not relevant for this project.
+```
+```{r}
+#Split title from year so we can do some exploratory analysis.
+movies$year<- as.numeric(str_sub(str_trim(movies$title) ,start = -5,end = -2)) 
+movies$title<- str_sub( str_trim(movies$title) ,start = 1,end = -8)
+```
+
+```{r}
+#looking at the data I've noticed we have some missing titles, which are necessary for our models. So let's deal with those.
+movies[movies==""]<-NA
+movies[movies==0]<-NA
+#Because now we'll start to remove values. Let's make sure we're differentiating our raw data from our clean one by working on a copy with a different name.
+movies_clean<-movies
+#Let's remove the movies that have no title, that is KEY for our systems.
+movies_clean<-movies_clean[-which(is.na(movies_clean$title)==TRUE),]
+dim(movies)
+dim(movies_clean)
+
+```
+```{r}
+#Let's see if we have any missing values in our rating data.
+ratings[ratings ==""]<-NA
+ratings[ratings == 0] <- NA
+anyNA(ratings)
+head(ratings)
+```
+```{r}
+uq_movieIds.movies <- unique(movies_clean$movieId) #9740
+uq_movieIds.ratings<-unique(ratings$movieId) #9724
+match_movieIds<-intersect(uq_movieIds.movies,uq_movieIds.ratings)
+
+
+#Remove the movies, from the movies dataset, that are not in the ratings dataset
+movies_match <- movies_clean[which(movies_clean$movieId %in% match_movieIds),]
+rownames(movies_match) <- NULL
+
+#Remove movies, from the ratings dataset, that are not in the movies dataset.
+ratings_match <- ratings[which(ratings$movieId %in% match_movieIds),]
+rownames(ratings_match) <- NULL
+
+summary(movies_match)
+summary(ratings_match)
+```
+
+```{r}
+#We now need to to split one-hot-encode our genres columns
+genres<-as.data.frame(movies_match$genres, stringsAsFactors = FALSE) #saving the genres column into a variable.
+#head(genres)
+genres.df<-as.data.frame(tstrsplit(genres[,1],'[|]', type.convert = TRUE), stringsAsFactors = FALSE) #Using transpose split to first, split the genres by "|" and then divide them by columns.
+colnames(genres.df)<-c(1:length(genres.df)) # The columns were automatically named by the genres list, so to make it easier to read, I added numbers by the length of the vector.
+#head(genres.df)
+
+#getting our list of unique genres.
+all_genres<- unique(unlist(strsplit(movies_match$genres,"\\|")))
+all_genres<- all_genres[!is.na(all_genres)]
+#all_genres
+
+#We have 9722 movie entries and 20 genres(19 actually, but we will remove "no genres listed" later on)
+#So I'm declaring an empty matrix, full of zeros, with 20 columns for our genres, and 9723 rows for our movies. I've accounted for an extra row so we can include the genre name at the top. We will use it for our loop, to identify the genres in each column.
+
+genre_mx<- matrix(0, 9723, 20)
+genre_mx[1,]<-all_genres # Add unique genres as the first row
+colnames(genre_mx)<- all_genres #Name the columns as the genres
+
+#now I'm adapting muffynomster's loop to iterate through the matrix.
+
+#For each row(r) and each column(c) in the genres df, if the genre on row 1 of the matrix, is equal to the genre of the row and column we're iterating in the df, save it's position to the genre_mx.col, and then the value of that position will be one.
+
+for (r in 1:nrow(genres.df)){
+  for (c in 1:ncol(genres.df)) {
+    genre_mx.col <- which(genre_mx[1,]==genres.df[r,c])
+    genre_mx[r+1, genre_mx.col]<-1 #row we're iterating plus 
+  }
+}
+
+genre_mx.df<-as.data.frame(genre_mx[-1,-20])#let's remove the first row that had the genre's name, we don't need it anymore, and let's go ahead and remove that no genres listed column.
+
+#head(genre_mx.df) 
+#Notice the data is saved as characters, we need to convert them to numeric to have a binary df. Using apply with as.integer, converts the df into a matrix array. So we'll have to convert it by using a loop.
+
+for (x in 1:ncol(genre_mx.df)){
+  genre_mx.df[,x]<-as.numeric(genre_mx.df[,x])
+}
+
+genre_mx.df<-cbind.data.frame(movieId=movies_match$movieId,genre_mx.df) #now that the movies have been one-hot encoded by genre. let's add the movie Id's back.
+
+head(genre_mx.df)
+
+```
+##DATA EXPLORATION
+```{r}
+genre_dist<- colSums(genre_mx.df[,-1])
+genre_dist_df = data.frame(genre = names(genre_dist),count = genre_dist)
+genre_dist_df$genre = factor(genre_dist_df$genre,levels = names(sort(genre_dist,decreasing = FALSE)))
+
+ggplot(genre_dist_df,aes(x=genre,y=count, fill=genre)) + 
+    geom_bar(stat = "identity") + 
+    coord_flip() + 
+    ggtitle("Movie Genre Distribution") + 
+    theme(legend.position = "none")
+```
+
+```{r}
+#avg rating by user
+
+ratbyuser<-ratings_match%>%
+  group_by(userId)%>%
+  summarise(avg=mean(rating))
+
+ggplot(ratbyuser, aes(avg)) + 
+  geom_histogram(stat= "bin", 
+                 col="red", 
+                 aes(fill=..count..)) +
+  scale_fill_gradient("Count", low="green", high="red")+
+  ggtitle("Average Rating by User")
+
+quantile(ratbyuser$avg)
+summary(ratbyuser)
+```
+```{r}
+#rate count by movie
+
+viewmovies<-ratings_match%>%
+  count(movieId)
+viewmovies1<-viewmovies
+
+viewmovie<-viewmovies[which(viewmovies$n>43),]
+ggplot(viewmovie, aes(n)) + 
+  geom_histogram(stat= "bin", 
+                 col="black", 
+                 aes(fill=..count..)) +
+  ggtitle("View Count by Movie")
+
+quantile(viewmovie$n)
+summary(viewmovie)
+```
+```{r}
+
+ggplot(movies_match, aes(year)) + 
+  geom_histogram(stat= "bin", 
+                 col="dark red", 
+                 aes(fill=..count..)) +
+  scale_fill_gradient("Count", low="pink", high="red")+
+  ggtitle("Movies by Release Year")
+
+
+quantile(movies_match$year,na.rm = TRUE)
+
+#Calculate the year that repeats the most. 
+uniqyear <- unique(movies_match$year)
+uniqyear[which.max(tabulate(match(movies_match$year, uniqyear)))]
+
+```
+
+```{r}
+#corrplot::corrplot(corr=)
+
+```
+
+##APRIORI STARTS HERE##
+
+```{r}
+movies_ratings<-left_join(ratings_match,movies_match, by="movieId")
+head(movies_ratings)
+```
+```{r}
+#We only want to take into account the movies with which the user has had a positive experience. So we will remove from our dataset, any rating/transaction rated 3 or lower.
+movies_ratings<-movies_ratings[which(movies_ratings$rating>3),]
+movies_ratings<-na.omit(movies_ratings)
+summary(movies_ratings)
+```
+
+```{r}
+#To implement the apriori algorithm, we implement each movie as an item, and each movie rating a user does will be our transactions. We implement a matrix where the users are the rows and the movies are the columns. We're left with 609 users and 7191 movies.
+
+user_movie_mx <- as(split(movies_ratings[,"title"], movies_ratings[,"userId"]), "transactions")
+user_movie_mx
+class(user_movie_mx)
+```
+
+#Association by Movie
+```{}
+#Some interaction code 
+var = readline(prompt = "Enter movie name");
+var = as.character(var);
+print(var)
+```
+
+```{r}
+#Here we make movie recommendations based on the movies users that watched the same movies
+movie <-"Coco"
+rules <- apriori(data=user_movie_mx, 
+                 parameter=list(supp=0.001,conf = 0.15, maxlen=2, minlen=2),
+                 appearance = list(default="rhs",lhs=movie),
+                 control = list(verbose=F))
+rules<-sort(rules, decreasing=TRUE,by="confidence")
+rules<-rules[1:10]
+rules<-inspect(rules)
+rules$rhs<-gsub("[[:punct:]]","", rules$rhs)
+rules$rhs
+```
+
+#All association rules
+```{r}
+#Next we find the association rules.
+assoc_rules <- apriori(user_movie_mx,parameter = list(supp=0.01, conf=0.7,maxlen=2))
+```
+
+```{r}
+assoc_rules <- as(assoc_rules,"data.frame") 
+summary(assoc_rules)
+head(assoc_rules)
+```
+
+```{r}
+assoc_rules$lhs_movie <- sapply(strsplit(as.character(assoc_rules$rules),'=>'), "[", 1)
+assoc_rules$rhs_movie<- sapply(strsplit(as.character(assoc_rules$rules),'=>'), "[", 2)
+assoc_rules$lhs_movie<- gsub("[[:punct:]]","", assoc_rules$lhs_movie)
+assoc_rules$rhs_movie<- gsub("[[:punct:]]","", assoc_rules$rhs_movie)
+assoc_rules$rules <- NULL
+
+assoc_rules<-as(assoc_rules, "data.frame")
+head(assoc_rules)
+summary(assoc_rules)
+```
+
+```{r}
+#"Lift" tells us how closely related items are to one another in transactions. In other words, do people watch movie A, because they've watched movie B? If the lift is 1, our answer it's no, now if the lift is greater than 1, our answer is probably yes.
+# Let's filter our rules by those that are higher than average.
+
+assoc_rules<- subset(assoc_rules, lift>4.394) 
+summary(assoc_rules)
+head(assoc_rules)
+```
+
+##CONTENT BASED FILTER##  
+
+```{r}
+#Let's binarize the ratings, setting 4 and above as good rating. Meaning 4:5= 1 (like) and 1:3=-1(dislike). Normally 0 would be set as dislike, but we need the negative numbers for when we binarize users genre ranking.
+ratings_bi<-ratings_match
+ratings_bi$rating<-ifelse(ratings_bi$rating>3,1,-1)
+ratings_bi1<-ratings_bi
+tail(ratings)
+tail(ratings_bi)
+#Transpose this data. so users are rows, top movies are columns, and ratings are content.
+```
+
+```{r}
+#We transpose the data so user Id's are the columns, movie Id's are the rows, and the ratings are the values.
+ratings_bi1<-reshape2::dcast(ratings_bi, movieId~userId, value.var="rating", na.rm=FALSE)
+#There are a lot of NA values, because not every movie was rated by every user, so we'll replace those na's with 0.
+ratings_bi1[is.na(ratings_bi1)]<-0
+##Match the MovieID order of ratings_bi, to genre_mx.df, to ensure they're on the same order
+ratings_bi2<-ratings_bi1[match(genre_mx.df$movieId,ratings_bi1$movieId),]
+head(ratings_bi2[,c(1:4)])
+```
+
+
+
+```{r}
+#Now I need a matrix that showcases a user's preference for the different genres based on their binarized ratings. So I need to calculate the user's scores for each genre. I will do this by multiplying the values from genre_mx.df, with the values from ratings_bi.The formula will look like this. Also known as the dot product.
+
+#(genre_mx.df[1,1]*ratings_bi[1,1]) + (genre_mx.df21,1]*ratings_bi[2,1])....
+
+#until we've multiplied every genre column, by each user binary ratings and added the results.
+
+dim.data.frame(ratings_bi2)#9722 rows(movies) and 610 user Id's
+dim.data.frame(genre_mx.df)#9722
+
+
+genre_score = data.frame(matrix(0, 19, 610,
+                dimnames=list(c(), c(unique(ratings_match$userId)))))
+
+mrating<-match(genre_mx.df$movieId,ratings_bi2$movieId)
+for (j in 1:ncol(ratings_bi2[,-1])){
+  for (i in 1:ncol(genre_mx.df[,-1])){
+    genre_score[i,j]<-sum((genre_mx.df[,-1][,i]) *(ratings_bi2[,-1][,j]))
+  }
+}
+
+rownames(genre_score)<-all_genres[-20]
+
+
+head(genre_score[,c(1:4)])
+```
+
+```{r}
+
+#rows represent genres, columns represent users. A High positive score means they really like a genre, and a high negative score means they really dislike it. 
+
+#genre_rating<-genre_score
+genre_score<-t(genre_score) #to make the matrix easier to read, and to be able to calculate the distance. I will transpose the data. It will also need to be transposed to calculate the similarity/distance with the genre_mx.df
+user.profile<-ifelse(genre_score>0,1,0) #make data binary so we can find the distance/similitude between a user's genre preference and a movie's genre.
+head(user.profile[,c(1:4)])
+```
+
+```{r}
+user<-"U2"
+user_prof<-(user.profile[user,])
+sim_mx<-rbind(user_prof,genre_mx.df[,-1])
+#row bind the users genre ratings, with the boolean genre dataframe.
+sim_mx<-data.frame(lapply(sim_mx, function(x){as.integer(x)})) #convert to integer
+
+#library(proxy)
+sim_results<- proxy::dist(sim_mx, method= "Jaccard") #Let's calculate the binary distance.
+
+sim_results<-as.data.frame(as.matrix(sim_results))
+sim_results<-sim_results[-1,1] #similarity of column 1, withouth row 1. column 1 is our user against all movies, and roow 1 is also our user.
+diss<-cbind.data.frame(genre_mx.df$movieId,sim_results)
+diss<-diss[order(sim_results),]
+rows<- which(movies_match$movieId %in% head(diss$`genre_mx.df$movieId`,))
+user.rec<-movies_match[rows,2]
+user.rec
+```
